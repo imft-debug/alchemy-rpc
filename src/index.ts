@@ -1,7 +1,7 @@
 interface Env {
     CORS_ALLOW_ORIGIN: string;
     ALCHEMY_API_KEY: string;
-    ALCHEMY_NETWORK?: string; // Optional: e.g., "eth-mainnet", "eth-goerli", etc.
+    ALCHEMY_NETWORK?: string;
 }
 
 export default {
@@ -11,6 +11,7 @@ export default {
         const corsHeaders: Record<string, string> = {
             "Access-Control-Allow-Methods": "GET, HEAD, POST, PUT, OPTIONS",
             "Access-Control-Allow-Headers": "*",
+            "Content-Type": "application/json"
         };
 
         if (supportedDomains) {
@@ -32,51 +33,90 @@ export default {
 
         // Determine the Alchemy base URL
         const network = env.ALCHEMY_NETWORK || 'eth-mainnet';
-        const alchemyBaseUrl = `https://${network}.g.alchemy.com/v2/${env.ALCHEMY_API_KEY}`;
+        const alchemyBaseUrl = `https://${network}.g.alchemy.com/v2`;
 
-        // Handle WebSocket upgrades
-        const upgradeHeader = request.headers.get('Upgrade');
-        if (upgradeHeader === 'websocket') {
-            const wsUrl = `wss://${network}.g.alchemy.com/v2/${env.ALCHEMY_API_KEY}`;
-            return await fetch(wsUrl, request);
-        }
-
-        // Process regular RPC requests
         try {
+            // Handle WebSocket upgrades
+            const upgradeHeader = request.headers.get('Upgrade');
+            if (upgradeHeader === 'websocket') {
+                const wsUrl = `wss://${network}.g.alchemy.com/v2/${env.ALCHEMY_API_KEY}`;
+                return await fetch(wsUrl, request);
+            }
+
             // Parse the incoming request
             const url = new URL(request.url);
-            const requestBody = await request.text();
+            const path = url.pathname;
             
+            // Validate the path to prevent API key exposure
+            if (path.includes(env.ALCHEMY_API_KEY)) {
+                return new Response(JSON.stringify({
+                    jsonrpc: "2.0",
+                    error: {
+                        code: -32000,
+                        message: "Invalid request"
+                    },
+                    id: null
+                }), {
+                    status: 400,
+                    headers: corsHeaders
+                });
+            }
+
+            // Get request body or create empty for GET requests
+            let requestBody = await request.text();
+            let method = request.method;
+            
+            // Handle GET requests (convert to POST for Alchemy)
+            if (method === 'GET') {
+                method = 'POST';
+                if (!requestBody) {
+                    requestBody = JSON.stringify({
+                        jsonrpc: "2.0",
+                        method: "eth_blockNumber",
+                        params: [],
+                        id: 1
+                    });
+                }
+            }
+
             // Create the proxy request to Alchemy
-            const proxyRequest = new Request(alchemyBaseUrl, {
-                method: request.method,
+            const proxyUrl = `${alchemyBaseUrl}/${env.ALCHEMY_API_KEY}`;
+            const proxyRequest = new Request(proxyUrl, {
+                method: method,
                 body: requestBody || null,
                 headers: {
                     'Content-Type': 'application/json',
-                    'X-Alchemy-Cloudflare-Proxy': 'true',
-                    ...(request.headers.get('Accept') && { 'Accept': request.headers.get('Accept')! }),
+                    'Accept': 'application/json',
                 }
             });
 
             // Forward the request to Alchemy
             const response = await fetch(proxyRequest);
             
-            // Return the response with CORS headers
-            return new Response(response.body, {
+            // Process the response to ensure no API key leaks
+            let responseBody = await response.text();
+            if (responseBody.includes(env.ALCHEMY_API_KEY)) {
+                responseBody = responseBody.replace(new RegExp(env.ALCHEMY_API_KEY, 'g'), '[REDACTED]');
+            }
+
+            // Return the sanitized response
+            return new Response(responseBody, {
                 status: response.status,
-                headers: {
-                    ...corsHeaders,
-                    'Content-Type': response.headers.get('Content-Type') || 'application/json',
-                },
+                headers: corsHeaders
             });
+
         } catch (error) {
             console.error('Error processing request:', error);
-            return new Response(JSON.stringify({ error: 'Internal server error' }), {
-                status: 500,
-                headers: {
-                    ...corsHeaders,
-                    'Content-Type': 'application/json',
+            return new Response(JSON.stringify({
+                jsonrpc: "2.0",
+                error: {
+                    code: -32000,
+                    message: "Internal server error"
                 },
+                id: null
+            }), {
+                status: 500,
+                headers: corsHeaders
             });
         }
     },
